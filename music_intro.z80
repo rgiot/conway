@@ -1,0 +1,4 @@
+ 
+  output music_intro.o
+  org 0
+  incbin "data/ASIAGENT.BIN" ,128

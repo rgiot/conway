@@ -1,0 +1,4 @@
+ output "gfxintro.o"
+
+ org 0
+ incbin "data/intro.scr" ,128

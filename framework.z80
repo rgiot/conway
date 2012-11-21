@@ -1,0 +1,119 @@
+/**
+ * Framework macros
+ */
+  /**
+   * Stops the interruption (without saving)
+   * @modified hl
+   */
+  macro FRAMEWORK_STOP_SYSTEM
+    di
+    ld  hl, 0xc9fb
+    ld (0x38), hl
+  endm
+
+  /**
+   * Change border color (usefull to manage time)
+   * @modified: bc, af
+   */
+  macro FRAMEWORK_TICK_BORDER coul
+    if DEBUG
+      ld bc, 0x7f10 : ld a, coul
+      out (c), c : out (c), a
+    endif
+  endm
+
+  /**
+   * Wait the vbl
+   * @modified: bc, af
+   */
+  macro FRAMEWORK_WAIT_VBL
+      ld b, 0xf5
+.loop    in a, (c)
+         rra
+      jr nc, .loop
+  endm
+
+  /**
+   * Change screen mode
+   * @modified: bc
+   */
+  macro FRAMEWORK_SET_MODE mode
+    if mode == 0
+      ld bc,0x7F8C
+      out (c),c
+    endif
+  endm
+
+  macro FRAMEWORK_SET_COLOR ink,color
+    ld bc, 0x7F00 + ink
+    out (c), c
+    ld c, color
+    out (c), c
+  endm
+
+  /**
+   * Slow way to clear screen.
+   * @modified: hl, de, bc
+   */
+  macro FRAMEWORK_CLEAR_BANK highmem
+    ld hl, 0x00 + 256*highmem : ld (hl), l
+    ld de, 0x01 + 256*highmem
+    ld bc, 0x4000
+    ldir
+  endm
+
+  /**
+   * Choose the bank to display on screen.
+   * Usefull only in debug mode (to analyse buffer evolution for example)
+   */
+  macro FRAMEWORK_DISPLAY_BANK bank
+    ld bc, 0xbc00 + 12 : out (c), c
+
+    ;Select the right screen mask
+    if bank == 0xC0
+      ld c, %00110000
+    endif
+    if bank == 0x80
+      ld c, %00100000  
+    endif
+    if bank == 0x40
+      ld c, %00010000  
+    endif
+    if bank == 0x00
+      ld c, %00000000  
+    endif
+
+    inc b : out (c), c
+  endm
+/**
+ * Check if some key have been pressed
+ * @input:d=matrix line number(0<=d<=9)
+ * @output:a=information on the line
+ */
+framework_keyboard
+;
+; Test clavier de la ligne
+; dont le numéro est dans D
+; D doit contenir une valeur de 0 à 9
+;
+        ld bc,0xf40e  ; Valeur 14 sur le port A
+        out (c),c
+        ld bc,0xb6c0  ; C'est un registre
+        out (c),c    ; BDIR=1, BC1=1
+        ld bc,0xf600  ; Validation
+        out (c),c
+        ld bc,0xf792  ; Port A en entrée
+        out (c),c
+        ld a,d       ; A=ligne clavier
+        or %01000000 ; BDIR=0, BC1=1
+        ld b,0xf6
+        out (c),a
+        ld b,0xf4     ; Lecture du port A
+        in a,(c)     ; A=Reg 14 du PSG
+        ld bc,0xf782  ; Port A en sortie
+        out (c),c
+        ld bc,0xf600  ; Validation
+        out (c),c
+; Et A contient la ligne
+    ret
+

@@ -1,0 +1,4 @@
+  
+  output music.o
+  org 0
+  incbin "data/BLDSTNS.BIN" ,128

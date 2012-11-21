@@ -1,0 +1,95 @@
+  output loader.o
+
+MEMORY_LOADING = 0x40 
+PLAYER_ADDRESS = 0x4000
+MUSIC_ADDRESS =  0x4990
+EFFECT_SCREEN_WIDTH equ 64
+
+
+  org 0x7000
+beginloader
+  jp go
+  ds 100
+  include framework.z80
+go
+  di
+  ld sp, beginloader
+  FRAMEWORK_STOP_SYSTEM
+
+  /**
+   * Display intro gfx
+   */
+    ld bc, 0xbc00 + 1: out (c), c ; Screen of 64 bytes
+    ld bc, 0xbd00 + EFFECT_SCREEN_WIDTH/2 : out (c), c
+
+    ld bc, 0xbc00 + 2: out (c), c ; Screen of 64 bytes
+    ld bc, 0xbd00 + 42: out (c), c
+
+    ld bc, 0xbc00 + 6 : out (c), c ; Height of display
+    ld bc, 0xbd00 + 32: out (c), c
+
+    ld bc, 0xbc00 + 7: out (c), c ; Screen of 64 bytes
+    ld bc, 0xbd00 + 34: out (c), c
+
+.initialize_ga
+    ;XXX Finalize this intialisation
+    ld bc, 0x7f10 : out (c), c
+    ld bc, 0x7f4B : out (c), c
+   
+    FRAMEWORK_SET_MODE 1
+
+    FRAMEWORK_SET_COLOR 0, 0x4B
+    FRAMEWORK_SET_COLOR 1, 0x4B
+    FRAMEWORK_SET_COLOR 2, 0x4B
+    FRAMEWORK_SET_COLOR 3, 0x4B
+
+    ld hl, player : ld de, PLAYER_ADDRESS : call deexo
+    ld hl, music_intro  : ld de, MUSIC_ADDRESS  : call deexo
+    ld hl, gfx : ld de, 0xC000 : call deexo
+
+    
+  FRAMEWORK_STOP_SYSTEM
+  ei
+    FRAMEWORK_DISPLAY_BANK 0xc0
+    FRAMEWORK_SET_COLOR 1, 0x5F
+    FRAMEWORK_SET_COLOR 2, 0x4C
+    FRAMEWORK_SET_COLOR 3, 0x54
+
+
+ ld de, MUSIC_ADDRESS
+  call PLAYER_ADDRESS
+  ; Wait a key press
+.loop
+  FRAMEWORK_WAIT_VBL
+  call PLAYER_ADDRESS +  3
+  halt
+  halt
+  halt
+  call PLAYER_ADDRESS +  3
+  ld d, 5
+  call framework_keyboard
+  and %10000000
+  jp nz, .loop
+
+
+  call PLAYER_ADDRESS+6
+  ld hl, conway : ld de, MEMORY_LOADING : call deexo
+  ld hl, music  : ld de, MUSIC_ADDRESS  : call deexo
+
+  jp MEMORY_LOADING
+
+  include deexo.asm
+conway
+  incbin conway.exo
+player
+  incbin player.exo
+music
+  incbin music.exo
+music_intro
+  incbin music_intro.exo
+gfx
+  incbin gfxintro.exo
+endloader
+loadersize = endloader - beginloader
+
+  assert endloader < 0xc000

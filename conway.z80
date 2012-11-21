@@ -1,0 +1,1968 @@
+; Game of life for Amstrad Expo Contest
+; 25 apr 2010
+; Krusty / Benediction
+; Written for sjamsplus
+
+/**
+ * TODO cleanup memory usage
+ *      set real music
+ *      clean screen and add logo
+ *      add sprite moving handler
+ */
+  output conway.o
+
+;;;;;;;;;;;;;
+; Constants ;
+;;;;;;;;;;;;;
+DEBUG  =0 
+MEMORY_LOADING = 0x40 ; Where to load
+
+PLAYER_ADDRESS = 0x4000
+MUSIC_ADDRESS =  0x4990
+
+; Each generation takes this number of frames
+CONWAY_MAX_FRAMES_PER_GENERATIONS =  12
+
+CONWAY_WIDTH =  16     ; Width of the effect
+CONWAY_HEIGHT = 12 ;16    ; Height of the effect
+CONWAY_USE_5HREE_BUFFER = 0
+
+/**
+ * Buffers are placed on an 256 aligned address.
+ * 0 symbolise dead cell, 1 symbolise alive cell.
+ * buffer(x,y) = buffer + x + 256*y
+ */
+CONWAY_BUFFER1 equ 0x8000 ; TODO: Choose an optimumum place
+CONWAY_BUFFER2 equ CONWAY_BUFFER1 + CONWAY_WIDTH + 10
+CONWAY_BUFFER3 equ CONWAY_BUFFER2 + CONWAY_WIDTH + 10
+
+;automata info
+CONWAY_STATE_INITIALIZING equ 0
+CONWAY_STATE_COMPUTING_NEXT_GENERATION equ 1
+CONWAY_STATE_DISPLAYING_PREVIOUS_GENERATION equ 2
+CONWAY_STATE_TOGGLING_SELECTED_CELL equ 3
+CONWAY_STATE_WAITING equ 4
+CONWAY_STATE_ROTATING_BUFFERS equ 4
+
+TITRE1_HEIGHT equ 3
+POS_TITRE2 = TITRE1_HEIGHT + 2*CONWAY_HEIGHT
+TITRE2_HEIGHT equ 5
+/**
+ * Screen buffers
+ */
+EFFECT_SCREEN1_ADDRESS equ 0xc000
+EFFECT_SCREEN2_ADDRESS equ 0xc000
+
+EFFECT_SCREEN_WIDTH equ 64
+
+  macro RESET_STACK
+    ld sp, 0x38
+  endm
+    org MEMORY_LOADING
+    di 
+    RESET_STACK
+    jp main
+
+;;;;;;;;;;;;;;;;;;;;;;;;;
+; Variables and buffers ;
+;;;;;;;;;;;;;;;;;;;;;;;;;
+
+conway_dirty_screen db 0
+
+;counter of frames
+conway_frame_counter db 0
+
+; Store the address of the buffers (we rotate them, 
+;    so buffer1 is not always the same)
+conway_buffer1_address dw CONWAY_BUFFER1
+conway_buffer2_address dw CONWAY_BUFFER2
+conway_buffer3_address dw CONWAY_BUFFER3
+
+; Store the address of the screen
+effect_screen1 dw EFFECT_SCREEN1_ADDRESS + TITRE1_HEIGHT * EFFECT_SCREEN_WIDTH
+effect_screen2 dw EFFECT_SCREEN2_ADDRESS + TITRE1_HEIGHT * EFFECT_SCREEN_WIDTH
+
+; Flags for keyboard
+conway_key_tempo db 0 ; Number of generation to wait after the key press
+conway_key_action db 0  ; 0 => nothing to do
+                        ; 1 => choose next pattern
+NOTHING_PRESSED = 0
+NEXT_PRESSED = 1
+PREVIOUS_PRESSED = 2
+
+;position of cursor on screen
+conway_cursor_x db 1 
+conway_cursor_y db 1
+conway_cursor_displayed db 1
+
+conway_required_pattern db 0 ; Number of pattern to display
+
+conway_actual_state db 0 ; store the actual state
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; things specifics for the framework ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+  /**
+   * Stops the interruption (without saving)
+   * @modified hl
+   */
+  macro FRAMEWORK_STOP_SYSTEM
+    di
+    ld  hl, 0xc9fb
+    ld (0x38), hl
+  endm
+
+  /**
+   * Change border color (usefull to manage time)
+   * @modified: bc, af
+   */
+  macro FRAMEWORK_TICK_BORDER coul
+    if DEBUG
+      ld bc, 0x7f10 : ld a, coul
+      out (c), c : out (c), a
+    endif
+  endm
+
+  /**
+   * Wait the vbl
+   * @modified: bc, af
+   */
+  macro FRAMEWORK_WAIT_VBL
+      ld b, 0xf5
+.loop    in a, (c)
+         rra
+      jr nc, .loop
+  endm
+
+  /**
+   * Change screen mode
+   * @modified: bc
+   */
+  macro FRAMEWORK_SET_MODE mode
+    if mode == 0
+      ld bc,0x7F8C
+      out (c),c
+    endif
+  endm
+
+  macro FRAMEWORK_SET_COLOR ink,color
+    ld bc, 0x7F00 + ink
+    out (c), c
+    ld c, color
+    out (c), c
+  endm
+
+  /**
+   * Slow way to clear screen.
+   * @modified: hl, de, bc
+   */
+  macro FRAMEWORK_CLEAR_BANK highmem
+    ld hl, 0x00 + 256*highmem : ld (hl), l
+    ld de, 0x01 + 256*highmem
+    ld bc, 0x4000
+    ldir
+  endm
+
+  /**
+   * Choose the bank to display on screen.
+   * Usefull only in debug mode (to analyse buffer evolution for example)
+   */
+  macro FRAMEWORK_DISPLAY_BANK bank
+    ld bc, 0xbc00 + 12 : out (c), c
+
+    ;Select the right screen mask
+    if bank == 0xC0
+      ld c, %00110000
+    endif
+    if bank == 0x80
+      ld c, %00100000  
+    endif
+    if bank == 0x40
+      ld c, %00010000  
+    endif
+    if bank == 0x00
+      ld c, %00000000  
+    endif
+
+    inc b : out (c), c
+  endm
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; things specifics for the demo ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+ /**
+   * Set the state of the main loop.
+   * USefull for interrupt handler when things
+   * are allowed only in some cases.
+   */
+  macro CONWAY_SET_STATE state
+    ld a, state
+    ld (conway_actual_state), a
+  endm
+
+ /**
+   * Increment the frame counter.
+   * This is called at each VBL.
+   * The aim of this counter is to have stable refresh speed
+   */
+  macro CONWAY_INC_FRAME_COUNTER
+    ld hl, conway_frame_counter
+    inc (hl)
+  endm
+  /**
+   * Reset Frame counter
+   */
+  macro CONWAY_RES_FRAME_COUNTER
+    ld hl, conway_frame_counter
+    xor a
+    ld (hl), a
+  endm
+  /**
+   * Wait while number of frame not reached
+   */
+  macro CONWAY_WAIT_END_OF_GENERATION
+    ld hl, conway_frame_counter
+.loop ld a,(hl)
+    cp CONWAY_MAX_FRAMES_PER_GENERATIONS
+    jr c, .loop
+  endm
+
+  macro CONWAY_WAIT_HALF_END_OF_GENERATION
+    ld hl, conway_frame_counter
+.loop ld a,(hl)
+    cp CONWAY_MAX_FRAMES_PER_GENERATIONS*2/3
+    jr c, .loop
+  endm
+
+
+  /**
+   * Play the music with saving register
+   */
+  macro CONWAY_INTER_MUSIC
+    FRAMEWORK_TICK_BORDER 0x54
+    exx: push hl: push de: push bc : exx : push ix : push iy
+    call PLAYER_ADDRESS + 3 ;begin_player + 3
+    pop iy : pop ix : exx : pop bc : pop de : pop hl : exx
+  endm
+
+/**
+ * Check if some key have been pressed
+ * @input:d=matrix line number(0<=d<=9)
+ * @output:a=information on the line
+ */
+framework_keyboard
+;
+; Test clavier de la ligne
+; dont le numéro est dans D
+; D doit contenir une valeur de 0 à 9
+;
+        ld bc,0xf40e  ; Valeur 14 sur le port A
+        out (c),c
+        ld bc,0xb6c0  ; C'est un registre
+        out (c),c    ; BDIR=1, BC1=1
+        ld bc,0xf600  ; Validation
+        out (c),c
+        ld bc,0xf792  ; Port A en entrée
+        out (c),c
+        ld a,d       ; A=ligne clavier
+        or %01000000 ; BDIR=0, BC1=1
+        ld b,0xf6
+        out (c),a
+        ld b,0xf4     ; Lecture du port A
+        in a,(c)     ; A=Reg 14 du PSG
+        ld bc,0xf782  ; Port A en sortie
+        out (c),c
+        ld bc,0xf600  ; Validation
+        out (c),c
+; Et A contient la ligne
+    ret
+/**
+ * Install the interruption handler
+ */
+demo_install_interrupt
+    ei
+    FRAMEWORK_WAIT_VBL
+    halt : halt : halt
+    FRAMEWORK_WAIT_VBL
+    di
+
+    ld a ,$c3 ; JP
+    ld hl, demo_effect_interrupt_handler
+    ld (0x38), a
+    ld (0x39), hl
+    ei
+    ret
+
+demo_effect_interrupt_handler
+  push af : push hl : push de : push bc
+
+  ; Check the number of halt
+.nb  ld a,5 
+  inc a
+  cp 6
+  jr nz, .no_end_of_frame
+  xor a
+.no_end_of_frame
+  ld (.nb+1), a
+
+
+  ld hl, interrupt_routs 
+  ld d, 0: ld e, a ;do not want to code tests ...
+  add hl, de
+  add hl, de
+
+  ld e, (hl)
+  inc hl
+  ld d, (hl)
+  ex de, hl
+  jp (hl)
+
+  macro END_OF_INTER
+    pop bc : pop de : pop hl : pop af
+    ei
+    ret
+  endm
+
+; Store adresses of the interrupt routs
+interrupt_routs
+  dw interrupt_rout1
+  dw interrupt_rout2
+  dw interrupt_rout3
+  dw interrupt_rout4
+  dw interrupt_rout5
+  dw interrupt_rout6
+
+/**
+ * First interruption
+ * - increment frame counter
+ * - play music
+ * - display cursor on screen
+ * - check keys
+ */
+interrupt_rout1
+  FRAMEWORK_TICK_BORDER 0x54
+  
+  call conway_display_cursor
+
+  FRAMEWORK_TICK_BORDER 0x5B
+  END_OF_INTER
+
+interrupt_rout2
+  FRAMEWORK_TICK_BORDER 0x5C
+  CONWAY_INTER_MUSIC
+  FRAMEWORK_SET_COLOR 2, 0x4C
+ ; CONWAY_INTER_MUSIC
+  FRAMEWORK_TICK_BORDER 0x54
+  END_OF_INTER
+
+interrupt_rout3
+;  CONWAY_INTER_MUSIC
+  FRAMEWORK_TICK_BORDER 0x48
+  END_OF_INTER
+
+interrupt_rout4
+;  CONWAY_INTER_MUSIC
+  FRAMEWORK_TICK_BORDER 0x4c
+  END_OF_INTER
+
+interrupt_rout5
+;  CONWAY_INTER_MUSIC
+  FRAMEWORK_TICK_BORDER 0x56
+  END_OF_INTER
+
+/**
+ * Last interruption
+ * - play music
+ * - remove cursor
+ */
+interrupt_rout6
+  FRAMEWORK_SET_COLOR 2, 0x40
+  FRAMEWORK_TICK_BORDER 0x54
+;  CONWAY_INTER_MUSIC
+  call conway_clear_cursor
+  call interrupt_check_key_press
+  CONWAY_INC_FRAME_COUNTER
+  FRAMEWORK_TICK_BORDER 0x5f
+  END_OF_INTER
+
+
+/**
+ * Check if some key have been pressed
+ * N=next pattern
+ * P=previous pattern
+ */
+interrupt_check_key_press
+  ld a, (conway_key_action)
+  or a
+  ret nz
+
+  ld a, (conway_key_tempo)
+  or a
+  jr z, .begin
+  dec a
+  ld (conway_key_tempo), a
+  ret
+
+.begin
+
+  ;Check N
+  ld d, 5
+  call framework_keyboard
+  ld b, a
+  and %01000000
+  jp z, conway_user_wants_next_pattern
+  ld a, b
+  and %10000000
+  jp z, conway_user_toogle
+
+  ;Check P
+  ld d, 3
+  call framework_keyboard
+  and %00001000
+  jp z, conway_user_wants_previous_pattern
+
+  ;Check left, up, down
+  ld d, 0
+  call framework_keyboard
+  ld b, a
+  and 1
+  jp z, conway_move_cursor_up
+  ld a, b
+  and 2
+  jp z, conway_move_cursor_left
+  ld a, b
+  and 4
+  jp z, conway_move_cursor_down
+  
+  ;Check right
+  ld d, 1
+  call framework_keyboard
+  and 1
+  jp z, conway_move_cursor_right
+
+  ;Check ESC
+  ld d, %1000
+  call framework_keyboard
+  and 4
+  jp z, conway_pause
+  ret
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; things specifics for the conway ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+ macro CONWAY_SET_KEY_MOVE_TEMPO
+      ld a, 5
+      ld (conway_key_tempo), a
+    endm
+
+
+    /**
+     * Test if user can use the cursor.
+     * If it is not the case, it returns
+     */
+    macro CONWAY_ASSERT_USER_CURSOR_CAN_WORK
+      ld a, (conway_pause+1)
+      or a
+      ret z
+
+      ld a, (conway_dirty_screen)
+      or a
+      ret nz
+
+    endm
+
+
+/**
+ * User want to set or unset the cell
+ */
+conway_user_toogle:
+    CONWAY_ASSERT_USER_CURSOR_CAN_WORK
+    RESET_STACK
+    ei ; activate interruptions
+
+
+    ; compute buffer address
+    ld a, (conway_cursor_x) : ld e, a
+    ld a, (conway_cursor_y) : ld d, a
+    ld hl, (conway_buffer2_address)
+    add hl, de
+
+    ; Toggle
+    ld a, 1
+    ld (conway_dirty_screen), a
+    xor (hl)
+    ld (hl), a
+
+    CONWAY_SET_KEY_MOVE_TEMPO
+    jp conway_main_effect.compute
+
+/**
+ * User want to stop computing
+ */
+conway_pause:
+    ld a, 0
+    or a
+    jr nz, .ask_start
+.ask_pause
+    RESET_STACK
+    ei
+    call conway_display_previous_generation; force refreshing (screen may be not totally displayed)
+    ld a, 1
+    ld (conway_pause+1), a
+    jr $
+
+.ask_start
+    RESET_STACK
+    ei
+    xor a
+    ld (conway_pause+1), a
+    jp conway_main_effect.compute
+
+
+  
+    
+   ;Cursor mouvt
+conway_move_cursor_left:
+    CONWAY_ASSERT_USER_CURSOR_CAN_WORK
+    CONWAY_SET_KEY_MOVE_TEMPO
+
+    ld a, (conway_cursor_x)
+    inc a
+    cp CONWAY_WIDTH-1
+    jr nz, .end
+    dec a
+.end
+    ld (conway_cursor_x), a
+    ret
+
+conway_move_cursor_right:
+    CONWAY_ASSERT_USER_CURSOR_CAN_WORK
+    CONWAY_SET_KEY_MOVE_TEMPO
+
+    ld a, (conway_cursor_x)
+    dec a
+    cp 0
+    jr nz, .end
+    inc a
+.end
+    ld (conway_cursor_x), a
+    ret
+
+conway_move_cursor_up:
+    CONWAY_ASSERT_USER_CURSOR_CAN_WORK
+    CONWAY_SET_KEY_MOVE_TEMPO
+
+    ld a, (conway_cursor_y)
+    dec a
+    cp 0
+    jr nz, .end
+    inc a
+.end
+    ld (conway_cursor_y), a
+    ret
+
+conway_move_cursor_down:
+    CONWAY_ASSERT_USER_CURSOR_CAN_WORK
+    CONWAY_SET_KEY_MOVE_TEMPO
+
+    ld a, (conway_cursor_y)
+    inc a
+    cp CONWAY_HEIGHT-1
+    jr nz, .end
+    dec a
+.end
+    ld (conway_cursor_y), a
+    ret
+
+/**
+ * Compute screen address where to display cursor
+ * and return it in hl
+ * @todo optimize this ugly code
+ * @output hl: address of cursor
+ */
+conway_get_cursor_screen_address
+    ld hl, 0xc000 + TITRE1_HEIGHT * EFFECT_SCREEN_WIDTH + 2
+
+    ld a, (conway_cursor_x)
+    ld d, 0
+    ld e, a
+
+    .4 add hl, de
+
+    ld a, (conway_cursor_y)
+    or a
+    ret z
+
+    ld b, a
+    ld de, EFFECT_SCREEN_WIDTH
+.loop
+    add hl, de
+    add hl, de
+    djnz .loop
+
+
+    ret
+
+ /**
+ * Operate the initialization:
+ * - stop interruptions
+ * - set CRCT
+ * - set Gate Array
+ * - initialize memory
+ * - compute the two first buffers
+ */    
+conway_initialize:
+    FRAMEWORK_STOP_SYSTEM
+
+    /*
+.initialize_crtc
+    ;XXX Finalize this intialisation
+    ld bc, 0xbc00 + 1: out (c), c ; Screen of 64 bytes
+    ld bc, 0xbd00 + EFFECT_SCREEN_WIDTH/2 : out (c), c
+*/
+    ld bc, 0xbc00 + 6 : out (c), c ; Height of display
+    ld bc, 0xbd00 + 31: out (c), c
+
+.initialize_ga
+
+    ;XXX Finalize this intialisation
+    ld bc, 0x7f10 : out (c), c
+    ld bc, 0x7f4B : out (c), c
+ 
+    FRAMEWORK_SET_MODE 1
+
+    FRAMEWORK_SET_COLOR 0, 0x4B
+    FRAMEWORK_SET_COLOR 1, 0x5F
+    FRAMEWORK_SET_COLOR 2, 0x4C
+    FRAMEWORK_SET_COLOR 3, 0x54
+
+.initialize_memory
+
+ ;   FRAMEWORK_CLEAR_BANK 0xC0 ;screen bank
+    FRAMEWORK_CLEAR_BANK 0x80 ;buffer banks
+
+
+
+    call display_titles
+    call conway_display_previous_generation
+.intialize_music
+    ld de, MUSIC_ADDRESS
+    call PLAYER_ADDRESS;begin_player
+    ret
+
+/**
+ * Display the two title logos
+ */
+display_titles
+
+.display_title1
+  ld hl, 0xC000
+  ld de, titre1
+  ld b, 8*TITRE1_HEIGHT
+.loop
+  push bc
+  push hl
+
+  ex hl, de
+  ld bc, EFFECT_SCREEN_WIDTH
+  ldir
+  ex hl, de
+
+  pop hl
+  call bc26
+
+  
+  pop bc
+  djnz .loop
+
+.display_title2
+  ld hl, 0xC000 + (EFFECT_SCREEN_WIDTH * POS_TITRE2)
+  ld de, titre2
+  ld b, 8*TITRE2_HEIGHT
+.loop2
+  push bc
+  push hl
+
+  ex hl, de
+  ld bc, EFFECT_SCREEN_WIDTH
+  ldir
+  ex hl, de
+
+  pop hl
+  call bc26
+
+  
+  pop bc
+  djnz .loop2
+
+  ret
+
+bc26
+      ld  bc, 0x800
+      add hl, bc
+      ret nc
+      ld  bc, 0xc000 + EFFECT_SCREEN_WIDTH
+      add hl, bc
+      ret
+/**
+ * Compute the newt generation.
+ * This generation is stored in buffer 3.
+ * Buffers 1 and 2 contain the previously computed
+ * generations.
+ */
+conway_compute_next_generation
+    ; initialize the buffers
+    ; read from de
+    ; write to hl
+    ld hl, (conway_buffer3_address) : ex de, hl
+    ld hl, (conway_buffer2_address)
+
+    ; skip first line/column
+    inc h : inc l
+    inc d : inc e
+
+    dup CONWAY_HEIGHT-2 ; Call the right number of times (forget border)
+      push hl : push de
+      call conway_compute_line
+      pop de : pop  hl
+      inc d : inc h ;next line in buffer
+    edup
+
+    ret
+
+/**
+ * Clear the computing buffer
+ */
+conway_clear_buffer
+    ;clear first line
+    xor a
+    push hl
+    dup CONWAY_WIDTH
+      ld (hl), a : inc l
+    edup
+
+    ;clear other lines 
+    dup CONWAY_HEIGHT-1
+      pop hl
+      ld e, l
+      ld d, h
+      inc d
+      push de
+
+      dup CONWAY_WIDTH 
+        ldi
+      edup
+    edup
+    pop hl
+
+    ret
+/**
+ * Compute the next line
+ * @input: hl=read buffer de=write buffer
+ */
+conway_compute_line
+    inc e : inc l ; skip first cell (and last)
+    dup CONWAY_WIDTH-2
+      call conway_compute_cell
+      ld (de), a ; store new state
+      inc e ; move next column
+      ;inc l already done
+
+    edup
+
+    ret
+
+  /**
+   * Count the number of neighbourgs of the cell and store it in a.
+   *
+   * 567
+   * 4X8
+   * 321
+   *
+   * @input: hl=buffer to read
+   * @output: a=result
+   *
+   * XXX look if possible to optimize by reading previously computed values
+   */
+  macro CONWAY_GET_NB_NEIGHBOURGS
+    inc l : dec h: ld a,(hl) ; 1
+    dec l : add a, (hl) ; 2
+    dec l : add a, (hl) ; 3
+    inc h : add a, (hl) ; 4
+    inc h : add a, (hl) ; 5
+    inc l : add a, (hl) ; 6
+    inc l : add a, (hl) ; 7
+    dec h : add a, (hl) ; 8
+  endm
+
+/**
+ * Compute the new value of the cell
+ * @input: de: new buffer (buffer3), hl=old buffer (buffer2)
+ * @output: a=value of the cell (0=dead, 1=alive), de, hl = new pos in buffer (x+=1)
+ * the value is stored in the result buffer
+ */
+conway_compute_cell
+    ld a, (hl)
+    or  a
+    jr  nz, .old_cell_alive
+
+.old_cell_dead
+    CONWAY_GET_NB_NEIGHBOURGS
+    cp 3
+    jr nz, .cell_is_dead
+    jr .cell_is_alive
+
+.old_cell_alive
+    CONWAY_GET_NB_NEIGHBOURGS
+    cp 2
+    jr z, .cell_is_alive
+    cp 3
+    jr z, .cell_is_alive
+
+.cell_is_dead
+    xor a
+    ret
+
+.cell_is_alive
+    ld a,1 ; 
+    ret
+
+/**
+ * Display the generation present in buffer 2.
+ * Information in buffers 1 and 2 are used to select
+ * the sprite displaying rout
+ * XXX Duplicate the call to avoid the loop
+ * XXX do not manage borders (always empty ...)
+ *     => add 2 columns/lines for buffer, or reduce loops
+ */
+conway_display_previous_generation
+    ; Initialize the vars
+
+
+    ld bc, (conway_buffer1_address)
+    ld de, (conway_buffer2_address)
+    ld hl, (conway_buffer3_address)
+
+    
+    exx
+    ld hl, (effect_screen1)
+    ld de, EFFECT_SCREEN_WIDTH
+
+    dup CONWAY_HEIGHT-1 ; Call the right number of times
+      exx : push bc : push de : push  hl : exx ; store read buffer
+      push hl ; store write buffer
+      call conway_display_line
+      ;Compute next line ; XXX optimize
+      pop hl : add hl, de : add hl, de
+      ;Next for read buffer
+      exx : pop hl : pop  de : pop bc 
+      inc b : inc d : inc h : exx
+    edup
+    call conway_display_line
+
+    FRAMEWORK_WAIT_VBL
+    xor a : ld (conway_dirty_screen), a
+    ret
+
+
+/**
+ * Display a line of cells in the screen buffer
+ */
+conway_display_line
+    dup (CONWAY_WIDTH-1)
+      call conway_display_cell ;XXX use a macro if not too big
+ .4   inc l ; go to next screen buffer address (sprite of 4 bytes)
+      ;read buffer already moved
+    edup
+    call conway_display_cell
+    ret
+
+  /**
+   * Macro displaying an arbitrary sprite in a very fast way
+   * The inputs are the sprite byte values.
+   * No masking is done.
+   * The sprite is 4bytesx8lines. 
+   * It is printed with inc l in a gray code way.
+   *
+   * @input: hl screen address
+   * @modified: nothing
+   */
+  macro CONWAY_DISPLAY_ARBITRARY_BLOCK b11,b12,b13,b14, b21,b22,b23,b24, b31,b32,b33,b34, b41,b42,b43,b44, b51,b52,b53,b54, b61,b62,b63,b64, b71,b72,b73,b74, b81,b82,b83,b84
+    ;line 1
+    ld (hl), b11
+    inc l : ld (hl), b12
+    inc l : ld (hl), b13
+    inc l : ld (hl), b14
+
+
+    ;line 2
+    set 3, h: ld (hl), b24
+    dec l : ld (hl), b23
+    dec l : ld (hl), b22
+    dec l : ld (hl), b21
+
+    ;line 4
+    set 4, h: ld (hl), b41
+    inc l: ld (hl), b42
+    inc l: ld (hl), b43
+    inc l: ld (hl), b44
+
+    ;line 3
+    res 3, h : ld (hl), b34
+    dec l : ld (hl), b33
+    dec l : ld (hl), b32
+    dec l : ld (hl), b31
+
+    ;line 7
+    set 5, h : ld (hl), b71
+    inc l : ld (hl), b72
+    inc l : ld (hl), b73
+    inc l : ld (hl), b74
+
+    ;line 8
+    set 3, h : ld (hl), b84
+    dec l : ld (hl), b83
+    dec l : ld (hl), b82
+    dec l : ld (hl), b81
+
+    ;line 6
+    res 4, h : ld (hl), b61
+    inc l : ld (hl), b62
+    inc l : ld (hl), b63
+    inc l : ld (hl), b64
+
+    ;line 5
+    res 3, h : ld (hl), b54
+    dec l : ld (hl) , b53
+    dec l : ld (hl) , b52
+    dec l : ld (hl) , b51
+
+    ;line 1
+    ;XXX activate only when not at the end of the line
+    res 5, h
+  endm
+
+  ;TODO generate it automatically from a sprite file
+  macro CONWAY_DISPLAY_CELL_DEAD
+    include ./data/LIVEDEAD.WIN.z80
+  endm
+
+  macro CONWAY_DISPLAY_CELL_LIVING_EAST
+ ld a, r
+    and %01111111: cp 64
+    jp nc, 2F
+1
+    include ./data/LIVEE.WIN.z80
+    jp 3F
+2
+    include ./data/LIVEE2.WIN.z80
+3
+
+
+  endm
+  macro CONWAY_DISPLAY_CELL_LIVING_WEST
+ ld a, r
+    and %01111111: cp 64
+    jp nc, 2F
+1
+    include ./data/LIVEO.WIN.z80
+    jp 3F
+2
+    include ./data/LIVEO2.WIN.z80
+3
+
+
+  endm
+
+  macro CONWAY_DISPLAY_CELL_LIVING_WEST_EAST
+     ld a, r
+    and %01111111: cp 64
+    jp nc, 2F
+1
+    include ./data/LIVEEO.WIN.z80
+    jp 3F
+2
+    include ./data/LIVEEO2.WIN.z80
+3
+
+
+  endm
+
+  macro CONWAY_DISPLAY_CELL_LIVING_NORTH
+     ld a, r
+    and %01111111: cp 64
+    jp nc, 2F
+1
+    include ./data/LIVEN.WIN.z80
+    jp 3F
+2
+    include ./data/LIVEN2.WIN.z80
+3
+
+
+  endm
+
+  macro CONWAY_DISPLAY_CELL_LIVING_NORTH_EAST
+     ld a, r
+    
+    and %01111111: cp 64
+    jp nc, 2F
+1
+    include ./data/LIVENE.WIN.z80
+    jp 3F
+2
+    include ./data/LIVENE2.WIN.z80
+3
+
+
+  endm
+
+  macro CONWAY_DISPLAY_CELL_LIVING_SOUTH
+     ld a, r
+    
+    and %01111111: cp 64
+    jp nc, 2F
+1
+    include ./data/LIVES.WIN.z80
+    jp 3F
+2
+    include ./data/LIVES2.WIN.z80
+3
+
+
+  endm
+  macro CONWAY_DISPLAY_CELL_LIVING_SOUTH_NORTH
+     ld a, r
+    
+    and %01111111: cp 64
+    jp nc, 2F
+1
+    include ./data/LIVENS.WIN.z80
+    jp 3F
+2
+    include ./data/LIVENS2.WIN.z80
+3
+
+
+  endm
+
+  macro CONWAY_DISPLAY_CELL_LIVING_SOUTH_NORTH_EAST
+     ld a, r
+    
+    and %01111111: cp 64
+    jp nc, 2F
+1
+    include ./data/LIVENES.WIN.z80
+    jp 3F
+2
+    include ./data/LIVENES2.WIN.z80
+3
+
+
+  endm
+
+  macro CONWAY_DISPLAY_CELL_LIVING_WEST_NORTH
+    include ./data/LIVENO.WIN.z80
+  endm
+
+  macro CONWAY_DISPLAY_CELL_LIVING_WEST_NORTH_SOUTH
+     ld a, r
+    
+    and %01111111: cp 64
+    jp nc, 2F
+1
+    include ./data/LIVENSO.WIN.z80
+    jp 3F
+2
+    include ./data/LIVENSO2.WIN.z80
+3
+
+
+  endm
+
+  macro CONWAY_DISPLAY_CELL_LIVING_WEST_NORTH_SOUTH_EAST
+    include ./data/LIVENESO.WIN.z80
+  endm
+
+
+  macro CONWAY_DISPLAY_CELL_LIVING_WEST_SOUTH
+  ld a, r
+    
+    and %01111111: cp 64
+    jp nc, 2F
+1
+    include ./data/LIVESO.WIN.z80
+    jp 3F
+2
+    include ./data/LIVESO2.WIN.z80
+3
+
+  endm
+
+  ; TODO: correct the erroneous cell
+  macro CONWAY_DISPLAY_CELL_LIVING_WEST_SOUTH_EST
+    ld a, r
+    
+    and %01111111: cp 64
+    jp nc, 2F
+1
+    include ./data/LIVEESO.WIN.z80
+    jp 3F
+2
+    include ./data/LIVEESO2.WIN.z80
+3
+
+
+  endm
+
+
+  macro CONWAY_DISPLAY_CELL_LIVING_ALONE
+    ld a, r
+    
+    and %011: 
+    or a : jp z, 4f
+    cp 1 : jp z, 3f
+    cp 2 : jp z, 2f
+1
+    include ./data/LIVE.WIN.z80
+    jp 5F
+2
+    include ./data/LIVE2.WIN.z80
+    jp 5F
+3
+    include ./data/LIVE3.WIN.z80
+    jp 5F
+4
+    include ./data/LIVE4.WIN.z80
+5
+  endm
+
+
+  macro CHOOSE_SPRITE one, two
+   ld a, r
+    
+    and %01111111: cp 64
+    jp nc, 2F
+1
+    include one
+    jp 3F
+2 
+    include two
+3
+  endm
+
+  macro  CONWAY_DISPLAY_CELL_LIVING_SOUTH_EAST
+    ld a, r
+    
+    and %01111111: cp 64
+    jp nc, 2F
+1
+    include ./data/LIVESE.WIN.z80
+    jp 3F
+2
+    include ./data/LIVESE2.WIN.z80
+3
+  endm
+
+  macro CONWAY_DISPLAY_CELL_LIVING_WEST_NORTH_EAST
+    ld a, r
+    
+    and %01111111: cp 64
+    jp nc, 2F
+1
+    include ./data/LIVENEO.WIN.z80
+    jp 3F
+2
+    include ./data/LIVENEO2.WIN.z80
+3
+
+  endm
+
+  ;TODO put alone sprite
+  macro CONWAY_DISPLAY_CELL_LIVING
+    include ./data/LIVE.WIN.z80
+  endm
+
+
+
+
+  macro CONWAY_DISPLAY_CELL_BIRTH
+    include ./data/LIVE2.WIN.z80
+  endm
+
+  macro CONWAY_DISPLAY_CELL_DIE
+    include ./data/LIVE3.WIN.z80
+  endm
+  macro CONWAY_DISPLAY_CELL_BIRTH_DIE
+    include ./data/LIVE4.WIN.z80
+  endm
+
+
+  /**
+   * Move the buffers in horizontal position.
+   * Must be called when correctly selected.
+   */
+  macro MOVE_X_BUFFERS
+    inc c
+    inc e
+    inc l
+  endm
+
+
+  macro CONWAY_DISPLAY_TEST_NORTH
+    dec d : ld a, (de) : inc d : or a
+  endm
+  macro CONWAY_DISPLAY_TEST_SOUTH
+    inc d : ld a, (de) : dec d : or a
+  endm
+  macro CONWAY_DISPLAY_TEST_EAST
+    inc e : ld a, (de) : dec e : or a
+  endm
+  macro CONWAY_DISPLAY_TEST_WEST
+    dec e : ld a, (de) : inc e : or a
+  endm
+
+
+
+
+/**
+ * Display the cell on screen.
+ * XXX Look if expandable in a macro to keep precious time
+ * XXX Use two sprite plotting: up to down and down to up
+ *
+ * @input: hl': screen address, bc, de, hl = buffers 1, 2 and 3
+ */
+conway_display_cell:
+;;;;;;;;;;;;;;;;;;;;
+; Sprite selection ;
+;;;;;;;;;;;;;;;;;;;;
+    exx ; select buffers
+.choose_sprite
+
+  if CONWAY_USE_5HREE_BUFFER 
+    ld a, (de) ; buff2
+    or  a
+    jp  z, .no_cell_buff2
+
+.cell_buff2 ; There is an alive cell !!
+    ld a, (bc) ;buff1
+    or a
+    jr z, .new_cell_in_buff2
+
+.cell_buff2_and_1 ; Cell was previously present
+    ld a , (hl) ; buff3
+    or a
+    jp z, .cell_will_die
+
+  else
+    ld a, (de)
+    or a
+    jp z, .no_cell_buff2
+  endif
+
+
+/**
+ * In this case, we have to test the 16 cases !
+ */
+    CONWAY_DISPLAY_TEST_EAST
+    jr z, .no_cell_at_east
+
+.cell_at_east
+    CONWAY_DISPLAY_TEST_WEST
+    jr z, .cell_at_east_but_west
+
+.cell_at_east_west
+    CONWAY_DISPLAY_TEST_NORTH
+    jr z, .cell_at_east_west_but_north
+
+.cell_at_east_west_north
+    CONWAY_DISPLAY_TEST_SOUTH
+    jp z, .cell_alive_west_north_east;.cell_at_east_south_but_west_north
+
+.cell_at_east_west_north_south
+    jp .cell_alive_west_north_south_east
+
+.cell_at_east_west_but_north
+    CONWAY_DISPLAY_TEST_SOUTH
+    jp z, .cell_alive_west_east ;.cell_at_east_north_south_but_west
+
+.cell_at_east_west_south_but_north
+    jp .cell_alive_west_south_east
+
+.cell_at_east_but_west
+    CONWAY_DISPLAY_TEST_SOUTH
+    jr z, .cell_at_east_but_west_south
+
+.cell_at_east__south_but_west
+    CONWAY_DISPLAY_TEST_NORTH
+    jp z, .cell_alive_south_east ; east_south_but_west_north
+
+.cell_at_east_south_north_but_west
+    jp .cell_alive_south_north_east
+
+
+.cell_at_east_but_west_south
+    CONWAY_DISPLAY_TEST_NORTH
+    jp z, .cell_alive_east ;.cell_at_east_but_west_south_orth
+.cell_at_east_north_but_west_south
+    jp .cell_alive_north_east
+
+
+.no_cell_at_east
+    CONWAY_DISPLAY_TEST_WEST
+    jr z, .no_cell_at_east_and_west
+
+.no_cell_at_east_but_west
+    CONWAY_DISPLAY_TEST_NORTH
+    jr z, .no_cell_at_east_north_but_west
+
+.no_cell_at_east_but_west_north
+    CONWAY_DISPLAY_TEST_SOUTH
+    jp z, .cell_alive_west_north;.no_cell_at_east_south_but_west_north
+
+.no_cell_at_east_but_west_north_south
+    jp .cell_alive_west_north_south
+
+.no_cell_at_east_north_but_west
+    CONWAY_DISPLAY_TEST_SOUTH
+    jp z, .cell_alive_west ;.no_cell_at_east_north_south_but_west
+
+.no_cell_at_east_north_but_west_south
+    jp .cell_alive_west_south
+
+
+.no_cell_at_east_and_west
+    CONWAY_DISPLAY_TEST_SOUTH
+    jr z, .no_cell_at_east_and_west_and_south
+
+.no_cell_at_east_and_west_but_south
+    CONWAY_DISPLAY_TEST_NORTH
+    jp z, .cell_alive_south
+
+.no_cell_at_east_and_west_but_south_north
+    jp .cell_alive_south_north
+
+
+.no_cell_at_east_and_west_and_south
+    CONWAY_DISPLAY_TEST_NORTH
+    jp z, .cell_alive_alone ;.no_cell_at_east_and_west_and_south_and_north
+.no_cell_at_east_and_west_and_south_but_north
+    jp .cell_alive_north
+
+    ;never call ...
+.new_cell_in_buff2
+    ld a, (hl)
+    or a
+    jp z, .cell_of_1gen
+    jp .cell_birth
+
+;;;;;;;;;;;;;;;;;;;;
+; Displaying routs ;
+;;;;;;;;;;;;;;;;;;;;
+.no_cell_buff2
+.display_sprite1 ; background
+    MOVE_X_BUFFERS
+    exx
+    CONWAY_DISPLAY_CELL_DEAD
+    ret
+
+;TODO select alone sprite
+.cell_alive
+.cell_always_alive
+.display_sprite2 ; living cell
+    MOVE_X_BUFFERS
+    exx
+    CONWAY_DISPLAY_CELL_LIVING
+    ret
+
+.cell_birth
+.display_sprite3 ; new cell
+    MOVE_X_BUFFERS
+    exx
+    CONWAY_DISPLAY_CELL_BIRTH
+    ret
+
+.cell_will_die
+.display_sprite4 ; dead cell
+    MOVE_X_BUFFERS
+    exx
+    CONWAY_DISPLAY_CELL_DIE
+    ret
+
+.cell_alive_alone
+    MOVE_X_BUFFERS
+    exx
+    CONWAY_DISPLAY_CELL_LIVING_ALONE
+    ret
+
+.cell_alive_south
+    MOVE_X_BUFFERS
+    exx
+    CONWAY_DISPLAY_CELL_LIVING_SOUTH
+    ret
+
+.cell_alive_south_east
+    MOVE_X_BUFFERS
+    exx
+    CONWAY_DISPLAY_CELL_LIVING_SOUTH_EAST
+    ret
+
+
+.cell_alive_west_north_east
+    MOVE_X_BUFFERS
+    exx
+    CONWAY_DISPLAY_CELL_LIVING_WEST_NORTH_EAST
+    ret
+
+.cell_alive_west_north
+    MOVE_X_BUFFERS
+    exx
+    CONWAY_DISPLAY_CELL_LIVING_WEST_NORTH
+    ret
+
+
+.cell_alive_west_south
+    MOVE_X_BUFFERS
+    exx
+    CONWAY_DISPLAY_CELL_LIVING_WEST_SOUTH
+    ret
+
+.cell_alive_west_south_east
+    MOVE_X_BUFFERS
+    exx
+    CONWAY_DISPLAY_CELL_LIVING_WEST_SOUTH_EST
+    ret
+
+
+.cell_alive_west_north_south
+    MOVE_X_BUFFERS
+    exx
+    CONWAY_DISPLAY_CELL_LIVING_WEST_NORTH_SOUTH
+    ret
+
+.cell_alive_west_north_south_east
+    MOVE_X_BUFFERS
+    exx
+    CONWAY_DISPLAY_CELL_LIVING_WEST_NORTH_SOUTH_EAST
+    ret
+
+
+.cell_alive_north
+    MOVE_X_BUFFERS
+    exx
+    CONWAY_DISPLAY_CELL_LIVING_NORTH
+    ret
+
+.cell_alive_north_east
+    MOVE_X_BUFFERS
+    exx
+    CONWAY_DISPLAY_CELL_LIVING_NORTH_EAST
+    ret
+
+
+.cell_alive_south_north
+    MOVE_X_BUFFERS
+    exx
+    CONWAY_DISPLAY_CELL_LIVING_SOUTH_NORTH
+    ret
+
+.cell_alive_south_north_east
+    MOVE_X_BUFFERS
+    exx
+    CONWAY_DISPLAY_CELL_LIVING_SOUTH_NORTH_EAST
+    ret
+
+
+.cell_alive_east
+    MOVE_X_BUFFERS
+    exx
+    CONWAY_DISPLAY_CELL_LIVING_EAST
+    ret 
+
+.cell_alive_west
+    MOVE_X_BUFFERS
+    exx
+    CONWAY_DISPLAY_CELL_LIVING_WEST
+    ret
+
+.cell_alive_west_east
+    MOVE_X_BUFFERS
+    exx
+    CONWAY_DISPLAY_CELL_LIVING_WEST_EAST
+    ret
+
+
+.cell_of_1gen
+.display_sprite5 ; cell with 1 generation
+    MOVE_X_BUFFERS
+    exx
+    CONWAY_DISPLAY_CELL_BIRTH_DIE
+    ret
+
+
+    DISPLAY 'Sprite Routs', /H, $-.no_cell_buff2
+/**
+ * Set the pattern in buffer 3
+ * Remember we compute all the things in buffer 3
+ *
+ * @todo implement a binary way of storing initial maze and computing it
+ */
+conway_set_pattern:
+    ld a, (conway_required_pattern) ;never overflows, check already be done
+    ld d, 0
+    ld e, a
+    ld hl, conway_pattern_functions
+    add hl, de
+    add hl, de
+    ld e, (hl) : inc hl
+    ld d, (hl) : push de
+    ld hl, (conway_buffer3_address)
+
+    push hl
+    call conway_clear_buffer
+    pop hl
+
+    ret
+
+    ;call conway_pattern_bar
+    ;call conway_pattern_frog
+    ;call conway_pattern_diehard
+
+    ;call conway_pattern_glider
+    ;ret
+
+/**
+     * Test if user can use the cursor.
+     * If it is not the case, it returns
+     */
+    macro CONWAY_ASSERT_USER_CAN_CHANGE_PATTERN
+      ld a, (conway_pause+1)
+      or a
+      ret nz
+    endm
+
+
+/**
+ * User asks to change to previous pattern.
+ */
+conway_user_wants_previous_pattern
+    CONWAY_ASSERT_USER_CAN_CHANGE_PATTERN
+    ld a, PREVIOUS_PRESSED : ld (conway_key_action), a
+
+    ld a, (conway_required_pattern)
+    dec a
+    ld (conway_required_pattern), a
+
+    cp 255
+    ret nz
+
+    ld a, 3
+    ld (conway_required_pattern), a
+    ret
+
+/**
+ * User asks to change to next_pattern.
+ */
+conway_user_wants_next_pattern
+    CONWAY_ASSERT_USER_CAN_CHANGE_PATTERN
+    ld a, NEXT_PRESSED : ld (conway_key_action), a
+
+    ld a, (conway_required_pattern)
+    inc a
+    ld (conway_required_pattern), a
+
+    ld hl, conway_pattern_functions
+    ld d, 0 : ld e, a
+    add hl, de
+    add hl, de
+
+    ;Check out of bound
+    ld a, (hl)
+    or a
+    ret nz
+
+    inc hl
+    ld a, (hl)
+    or  a
+    ret nz
+
+    xor a
+    ld (conway_required_pattern), a
+
+    ret
+
+conway_pattern_glider
+    ld de, 0x0803
+    add hl, de
+
+    ld (hl), 1 : inc h
+    ld (hl), 1 : inc l
+    ld (hl), 1 : inc h
+    ld (hl), 1 : dec l : dec l
+    ld (hl), 1
+    ret
+
+conway_pattern_diehard
+    ld de, 0x0505
+    add hl, de
+
+    ld (hl), 1 : inc h
+    ld (hl), 1 : dec l
+    ld (hl), 1
+
+    ld de, 0x0106
+    add hl, de
+
+    ld (hl), 1 : dec h : dec h
+    ld (hl), 1 : inc l
+    ld (hl), 1 : dec l : dec l
+    ld (hl), 1
+    ret
+
+conway_pattern_frog
+     ld de, 0x0507
+    add hl, de
+    ld (hl), 1 : dec l : inc h
+    ld (hl), 1 : inc h
+    ld (hl), 1 : inc l: inc l: inc h
+    ld (hl), 1 : dec h : inc l
+    ld (hl), 1: dec h 
+    ld (hl), 1
+
+    ret
+
+conway_pattern_bar
+    ld de, 0x0507
+    add hl, de
+
+    ld (hl), 1 : inc l 
+    ld (hl), 1 : inc l
+    ld (hl), 1 
+
+
+    ret
+
+conway_pattern_queen
+  ld de, 0x303
+  add hl, de
+
+  ld a, 1
+  ld (hl), a : inc l : ld (hl), a
+  inc l: inc h : ld (hl), a
+  inc l: inc h : ld (hl), a
+  inc h : ld (hl), a
+  inc h : ld (hl), a
+  inc h : dec l : ld (hl), a
+  inc h : dec l : ld (hl), a
+  dec l : ld (hl), a
+  ret
+
+  dw 0
+conway_pattern_functions
+  dw conway_pattern_queen
+  dw conway_pattern_glider
+  dw conway_pattern_diehard
+  dw conway_pattern_frog
+  dw conway_pattern_bar
+conway_pattern_functions_end
+  dw 0
+
+/**
+ * Operate the buffer rotation
+ * buffer 3 -> buffer 2 -> buffer 1 -|
+ *   ^                               |
+ *   |-------------------------------|
+ */
+conway_rotate_buffers
+    ; Rotate conway buffers
+    ld hl, (conway_buffer1_address): push hl
+    ld hl, (conway_buffer2_address) : ld (conway_buffer1_address), hl
+    ld hl, (conway_buffer3_address) : ld (conway_buffer2_address), hl
+    pop hl : ld (conway_buffer3_address), hl
+    ret
+    
+    ; rotate flipping screens ?
+    ld hl, (effect_screen1) : push hl
+    ld hl, (effect_screen2)
+
+    ld (effect_screen1), hl : pop hl
+    ld (effect_screen2), hl
+
+    ret
+
+/**
+ * Rotate buffers in reverse order
+ * buffer 3 <- buffer 2 <- buffer 1 -|
+ *   ^                               |
+ *   |-------------------------------|
+ */
+conway_reverse_rotate_buffers
+    ld hl, (conway_buffer3_address) : push hl
+    ld hl, (conway_buffer2_address) : ld (conway_buffer3_address), hl
+    ld hl, (conway_buffer1_address) : ld (conway_buffer2_address), hl
+    pop hl : ld (conway_buffer1_address), hl
+    ret
+
+/**
+ * Launch a loop of the conway effect.
+ * The loop is splitted in different parts:
+ *  - next generation computing
+ *  - previous generation displaying
+ *  - rotate the buffers (game of life and screen)
+ */ 
+conway_main_effect
+.loop:
+    CONWAY_SET_STATE CONWAY_STATE_WAITING
+    CONWAY_WAIT_END_OF_GENERATION
+
+.compute
+    CONWAY_SET_STATE CONWAY_STATE_COMPUTING_NEXT_GENERATION
+    CONWAY_RES_FRAME_COUNTER
+ ;   ld bc, 0x7F00: out (c), c : ld bc, 0x7F54: out (c), c
+
+    call conway_compute_next_generation
+
+.display
+    CONWAY_SET_STATE CONWAY_STATE_DISPLAYING_PREVIOUS_GENERATION
+    call conway_display_previous_generation
+    CONWAY_WAIT_HALF_END_OF_GENERATION
+    call conway_display_previous_generation
+
+    ;if pause activated, do nothing
+.pause    ld a, (conway_pause+1)
+    or a
+    jr nz, .pause
+    CONWAY_SET_KEY_MOVE_TEMPO
+
+    ld a, (conway_key_action)
+    cp NOTHING_PRESSED
+    jp z, .end
+
+    ;An action must be done
+    ; For the moment, its just displaying a new pattern
+    CONWAY_SET_STATE CONWAY_STATE_INITIALIZING
+    call conway_set_pattern
+    call conway_display_previous_generation
+    ld a, NOTHING_PRESSED : ld (conway_key_action), a
+
+.end 
+    CONWAY_SET_STATE CONWAY_STATE_ROTATING_BUFFERS
+    call conway_rotate_buffers
+
+;    ld bc, 0x7F00: out (c), c : ld bc, 0x7F45: out (c), c
+
+
+    jp .loop
+
+
+  ; TODO put the real value of the sprite !
+cursor_sprite    
+  db 0xf1, 0xff, 0xfe;, 0xf1
+  db 0x0a, 0x3a, 0xf1;, 0x05  
+  db 0x36, 0xf1, 0x0a;, 0x3a 
+  db 0xf1, 0x05, 0x36;, 0xf1 
+  db 0x0a, 0x3a, 0xf1;, 0x05
+  db 0x36, 0xf1, 0xff;, 0xfe
+  db 0x06, 0x10, 0x00;, 0x08
+  db 0x03, 0x1a, 0x0f;, 0x0f
+/**
+ * Display cursor on screen
+ * Called during interruption
+ */
+conway_display_cursor
+    CONWAY_ASSERT_USER_CURSOR_CAN_WORK
+;    ld a, (conway_cursor_displayed) : or a : ret z
+  
+    call conway_get_cursor_screen_address
+    ld (conway_last_cursor_address), hl
+
+conway_save_cursor
+    push de
+    ld de, cursor_sprite
+
+    ;line 1
+    ld a, (hl) : ld (cursor_saved_byte11), a 
+    ld a ,(de) : ld (hl), a : inc e
+    inc l : ld a, (hl) : ld (cursor_saved_byte_12), a
+    ld a, (de) : ld (hl), a : inc e
+    dec l
+
+
+    ;line 2
+    set 3, h
+    ld a, (hl) : ld (cursor_saved_byte21), a 
+    ld a ,(de) : ld (hl), a : inc e
+    inc l : ld a, (hl) : ld (cursor_saved_byte_22), a
+    ld a, (de) : ld (hl), a : inc e
+    dec l
+
+
+    ;line 4
+    set 4, h
+    ld a, (hl) : ld (cursor_saved_byte41), a 
+    ld a ,(de) : ld (hl), a : inc e
+    inc l : ld a, (hl) : ld (cursor_saved_byte_42), a
+    ld a, (de) : ld (hl), a : inc e
+    dec l
+
+
+    ;line 3
+    res 3, h
+    ld a, (hl) : ld (cursor_saved_byte31), a 
+    ld a ,(de) : ld (hl), a : inc e
+    inc l : ld a, (hl) : ld (cursor_saved_byte_32), a
+    ld a, (de) : ld (hl), a : inc e
+    dec l
+
+
+    ;line 7
+    set 5, h
+    ld a, (hl) : ld (cursor_saved_byte71), a 
+    ld a ,(de) : ld (hl), a : inc e
+    inc l : ld a, (hl) : ld (cursor_saved_byte_72), a
+    ld a, (de) : ld (hl), a : inc e
+    dec l
+
+
+    ;line 8
+    set 3, h
+    ld a, (hl) : ld (cursor_saved_byte81), a 
+    ld a ,(de) : ld (hl), a : inc e
+    inc l : ld a, (hl) : ld (cursor_saved_byte_82), a
+    ld a, (de) : ld (hl), a : inc e
+    dec l
+
+
+    ;line 6
+    res 4, h
+    ld a, (hl) : ld (cursor_saved_byte61), a 
+    ld a ,(de) : ld (hl), a : inc e
+    inc l : ld a, (hl) : ld (cursor_saved_byte_62), a
+    ld a, (de) : ld (hl), a : inc e
+    dec l
+
+
+    ;line 5
+    res 3, h
+    ld a, (hl) : ld (cursor_saved_byte51), a 
+    ld a ,(de) : ld (hl), a : inc e
+    inc l : ld a, (hl) : ld (cursor_saved_byte_52), a
+    ld a, (de) : ld (hl), a : inc e
+    dec l
+
+;    ld de , EFFECT_SCREEN_WIDTH
+;    include data/CURSO16.WIN.z80
+    pop de
+    ret
+
+cursor_saved_byte11 db 0
+cursor_saved_byte21 db 0
+cursor_saved_byte31 db 0
+cursor_saved_byte41 db 0
+cursor_saved_byte51 db 0
+cursor_saved_byte61 db 0
+cursor_saved_byte71 db 0
+cursor_saved_byte81 db 0
+cursor_saved_byte_12 db 0
+cursor_saved_byte_22 db 0
+cursor_saved_byte_32 db 0
+cursor_saved_byte_42 db 0
+cursor_saved_byte_52 db 0
+cursor_saved_byte_62 db 0
+cursor_saved_byte_72 db 0
+cursor_saved_byte_82 db 0
+
+/**
+ * Remove cursor from screen
+ * Called during interruption
+ */
+conway_clear_cursor
+    CONWAY_ASSERT_USER_CURSOR_CAN_WORK
+
+conway_last_cursor_address equ $+1
+    ld hl, 0xc000
+   
+    push de
+
+    ;line 1
+    ld a, (cursor_saved_byte11) : ld (hl), a : inc l
+    ld a, (cursor_saved_byte_12): ld (hl), a : dec l
+
+
+    ;line 2
+    set 3, h
+    ld a, (cursor_saved_byte21) : ld (hl), a : inc l
+    ld a, (cursor_saved_byte_22): ld (hl), a : dec l
+
+
+    ;line 4
+    set 4, h
+    ld a, (cursor_saved_byte41) : ld (hl), a : inc l
+    ld a, (cursor_saved_byte_42): ld (hl), a : dec l
+
+
+
+    ;line 3
+    res 3, h
+    ld a, (cursor_saved_byte31) : ld (hl), a : inc l
+    ld a, (cursor_saved_byte_32): ld (hl), a : dec l
+
+
+
+    ;line 7
+    set 5, h
+    ld a, (cursor_saved_byte71) : ld (hl), a : inc l
+    ld a, (cursor_saved_byte_72): ld (hl), a : dec l
+
+
+
+    ;line 8
+    set 3, h
+    ld a, (cursor_saved_byte81) : ld (hl), a : inc l
+    ld a, (cursor_saved_byte_82): ld (hl), a : dec l
+
+
+    ;line 6
+    res 4, h
+    ld a, (cursor_saved_byte61) : ld (hl), a : inc l
+    ld a, (cursor_saved_byte_62): ld (hl), a : dec l
+
+
+    ;line 5
+   res 3, h
+    ld a, (cursor_saved_byte51) : ld (hl), a : inc l
+    ld a, (cursor_saved_byte_52): ld (hl), a : dec l
+
+
+    pop de
+
+
+    ret
+
+/**
+ * Main point of the program
+ */
+main:
+    CONWAY_SET_STATE CONWAY_STATE_INITIALIZING
+    call conway_initialize ; launch various initialization
+    call conway_set_pattern
+    call conway_rotate_buffers
+
+    ;Compute buffer1 and buffer2
+    ;buffer2 will be displayed after computation of buffer3
+  DUP 2
+    call conway_compute_next_generation
+    call conway_rotate_buffers
+  EDUP
+
+
+    call demo_install_interrupt
+    call conway_main_effect
+titre1
+  incbin "data/TITRE1.WIN" ,128
+titre2
+  incbin "data/TITRE2.WIN" ,128
+  DISPLAY 'End = ', /H, $
+  ASSERT 0x4000

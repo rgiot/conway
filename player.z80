@@ -1,0 +1,4 @@
+  
+  output player.o
+  org 0
+  incbin "data/PLAYER.BIN" ,128
